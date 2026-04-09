@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from org-jupytext-tools!")
+"""Tools for converting between Org and Jupytext notebook formats."""

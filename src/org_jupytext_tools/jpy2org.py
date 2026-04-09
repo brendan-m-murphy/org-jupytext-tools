@@ -1,69 +1,38 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "jupytext>=1.19.1",
-#   "PyYAML>=6.0",
-# ]
-# ///
-
-"""Convert a Jupytext-readable notebook or .ipynb file to Org format.
-
-The script is intentionally narrow:
-- Input can be a Jupyter notebook (``.ipynb``) or a text notebook that Jupytext can read.
-- Non-markdown inputs are normalized to temporary ``md:pandoc`` with Jupytext.
-- Markdown inputs are converted directly with Pandoc.
-- Kernel metadata is extracted from Jupyter YAML front matter when present and written back
-  into the Org file as ``#+PROPERTY: header-args:jupyter-<lang> ...``.
-- By default, Python code blocks are rewritten from ``python`` to ``jupyter-python``
-  (and similarly for other kernel languages when known).
-"""
-
 from __future__ import annotations
 
 import argparse
-import re
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from typing import Final
 
-import yaml
-from jupytext.pandoc import PandocError, raise_if_pandoc_is_not_available
-
-MARKDOWN_SUFFIXES: Final[set[str]] = {".md", ".markdown", ".qmd", ".rmd"}
-FRONT_MATTER_RE: Final[re.Pattern[str]] = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
-LEADING_HTML_ANCHOR_RE: Final[re.Pattern[str]] = re.compile(
-    r'(?m)^`<span id="[^"]+"></span>`\{=html\}[ \t]*\n(?:[ \t]*\n)?'
+from .common import (
+    ConversionError,
+    NotebookMetadata,
+    build_org_header_args_property,
+    ensure_pandoc_available,
+    extract_kernel_metadata_from_markdown,
+    infer_output_suffix,
+    insert_org_header_args_property,
+    is_markdown_like,
+    make_jupyter_block_language,
+    normalize_kernel_language,
+    rewrite_source_block_language,
+    run_checked,
+    strip_html_anchor_lines,
+    temporary_directory,
+    temporary_text_file,
 )
-ORG_HEADER_ARGS_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?im)^#\+PROPERTY:\s*header-args:(jupyter-[^\s]+)\b.*$"
-)
-ORG_BEGIN_SRC_RE_TEMPLATE: Final[str] = r"(?im)^(#\+begin_src\s+){}(?=\s|$)"
 
 
-class ConversionError(RuntimeError):
-    """Raised when conversion fails in a user-facing way."""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments for the Jupytext to Org converter.
 
+    Args:
+        argv: Optional argument list. When omitted, arguments are read from
+            ``sys.argv``.
 
-class NotebookMetadata(dict):
-    """Notebook metadata extracted from a markdown YAML header."""
-
-    @property
-    def kernel_name(self) -> str | None:
-        return self.get("kernel_name")
-
-    @property
-    def kernel_display_name(self) -> str | None:
-        return self.get("kernel_display_name")
-
-    @property
-    def kernel_language(self) -> str | None:
-        return self.get("kernel_language")
-
-
-def parse_args() -> argparse.Namespace:
+    Returns:
+        The parsed argument namespace.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Convert a Jupyter notebook or Jupytext-readable text notebook to Org format via md:pandoc."
@@ -116,65 +85,44 @@ def parse_args() -> argparse.Namespace:
             "Do not rewrite fenced-code languages like 'python' to Org src languages like 'jupyter-python'."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def infer_output_path(input_path: Path) -> Path:
+    """Infer the default Org output path for an input file."""
     return input_path.with_suffix(".org")
 
 
-def run_checked(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-    if proc.returncode != 0:
-        stderr = proc.stderr.strip()
-        stdout = proc.stdout.strip()
-        details = stderr or stdout or f"Command exited with status {proc.returncode}."
-        raise ConversionError(f"Command failed: {' '.join(cmd)}\n{details}")
-    return proc
+def prepare_markdown_input(
+    input_path: Path,
+    keep_html_anchors: bool,
+) -> tuple[str, NotebookMetadata]:
+    """Load markdown notebook text and extract any embedded kernel metadata.
 
+    Args:
+        input_path: Markdown-like notebook path.
+        keep_html_anchors: Whether to preserve raw HTML anchor lines.
 
-def is_markdown_like(path: Path) -> bool:
-    return path.suffix.lower() in MARKDOWN_SUFFIXES
-
-
-def strip_leading_html_anchors(text: str) -> str:
-    return LEADING_HTML_ANCHOR_RE.sub("", text)
-
-
-def extract_notebook_metadata_from_markdown(text: str) -> NotebookMetadata:
-    metadata = NotebookMetadata()
-    match = FRONT_MATTER_RE.match(text)
-    if not match:
-        return metadata
-
-    front_matter = yaml.safe_load(match.group(1)) or {}
-    jupyter_meta = front_matter.get("jupyter", {}) or {}
-    kernelspec = jupyter_meta.get("kernelspec", {}) or {}
-    language_info = jupyter_meta.get("language_info", {}) or {}
-
-    kernel_name = kernelspec.get("name")
-    kernel_display_name = kernelspec.get("display_name")
-    kernel_language = kernelspec.get("language") or language_info.get("name")
-
-    if kernel_name:
-        metadata["kernel_name"] = str(kernel_name)
-    if kernel_display_name:
-        metadata["kernel_display_name"] = str(kernel_display_name)
-    if kernel_language:
-        metadata["kernel_language"] = str(kernel_language)
-
-    return metadata
-
-
-def prepare_markdown_input(input_path: Path, keep_html_anchors: bool) -> tuple[str, NotebookMetadata]:
+    Returns:
+        The cleaned markdown text and extracted notebook metadata.
+    """
     text = input_path.read_text(encoding="utf-8")
-    metadata = extract_notebook_metadata_from_markdown(text)
+    metadata = extract_kernel_metadata_from_markdown(text)
     if not keep_html_anchors:
-        text = strip_leading_html_anchors(text)
+        text = strip_html_anchor_lines(text)
     return text, metadata
 
 
 def convert_with_jupytext_to_markdown(input_path: Path, temp_md: Path) -> str:
+    """Normalize a notebook source into temporary ``md:pandoc`` text.
+
+    Args:
+        input_path: Notebook source path readable by Jupytext.
+        temp_md: Destination path for the temporary markdown notebook.
+
+    Returns:
+        The generated markdown text.
+    """
     run_checked(
         [
             sys.executable,
@@ -191,13 +139,13 @@ def convert_with_jupytext_to_markdown(input_path: Path, temp_md: Path) -> str:
 
 
 def convert_markdown_text_to_org(markdown_text: str, output_path: Path) -> None:
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".md", delete=False, encoding="utf-8"
-    ) as temp_md:
-        temp_md.write(markdown_text)
-        temp_md_path = Path(temp_md.name)
+    """Convert markdown notebook text into Org using Pandoc.
 
-    try:
+    Args:
+        markdown_text: Markdown notebook text to convert.
+        output_path: Destination path for the Org output.
+    """
+    with temporary_text_file(markdown_text, suffix=".md") as temp_md_path:
         run_checked(
             [
                 "pandoc",
@@ -210,67 +158,6 @@ def convert_markdown_text_to_org(markdown_text: str, output_path: Path) -> None:
                 str(output_path),
             ]
         )
-    finally:
-        temp_md_path.unlink(missing_ok=True)
-
-
-def normalize_kernel_language(language: str | None) -> str:
-    if not language:
-        return "python"
-    return language.strip().lower()
-
-
-def make_jupyter_block_language(language: str | None) -> str:
-    return f"jupyter-{normalize_kernel_language(language)}"
-
-
-def build_org_header_args_property(
-    block_language: str,
-    kernel_name: str | None,
-    session: str | None,
-    use_async: bool,
-    exports: str | None,
-) -> str:
-    parts = [f"#+PROPERTY: header-args:{block_language}"]
-    if kernel_name:
-        parts.extend([":kernel", kernel_name])
-    if session:
-        parts.extend([":session", session])
-    if use_async:
-        parts.extend([":async", "yes"])
-    if exports:
-        parts.extend([":exports", exports])
-    return " ".join(parts)
-
-
-def insert_org_header_property(org_text: str, property_line: str | None) -> str:
-    if not property_line:
-        return org_text
-
-    if ORG_HEADER_ARGS_RE.search(org_text):
-        return org_text
-
-    lines = org_text.splitlines(keepends=True)
-    insert_at = 0
-    while insert_at < len(lines):
-        stripped = lines[insert_at].strip()
-        if stripped.startswith("#+") and not stripped.lower().startswith("#+begin_"):
-            insert_at += 1
-            continue
-        if stripped == "":
-            insert_at += 1
-            continue
-        break
-
-    prefix = "".join(lines[:insert_at])
-    suffix = "".join(lines[insert_at:])
-    separator = "" if prefix.endswith("\n") or not prefix else "\n"
-    return f"{prefix}{separator}{property_line}\n{suffix}"
-
-
-def rewrite_org_block_language(org_text: str, source_language: str, target_language: str) -> str:
-    pattern = re.compile(ORG_BEGIN_SRC_RE_TEMPLATE.format(re.escape(source_language)))
-    return pattern.sub(rf"\1{target_language}", org_text)
 
 
 def postprocess_org_output(
@@ -282,6 +169,17 @@ def postprocess_org_output(
     exports: str | None,
     keep_source_language: bool,
 ) -> None:
+    """Insert Org header args and optionally rewrite source block languages.
+
+    Args:
+        output_path: Org output path to update in place.
+        kernel_name: Kernel name for the header args property.
+        kernel_language: Kernel language used for block rewriting.
+        session: Optional Org-babel session name.
+        use_async: Whether to add ``:async yes`` to the property.
+        exports: Optional ``:exports`` value for the property.
+        keep_source_language: Whether to keep the original source block language.
+    """
     org_text = output_path.read_text(encoding="utf-8")
     normalized_language = normalize_kernel_language(kernel_language)
     jupyter_block_language = make_jupyter_block_language(kernel_language)
@@ -293,10 +191,10 @@ def postprocess_org_output(
         use_async=use_async,
         exports=exports,
     )
-    org_text = insert_org_header_property(org_text, property_line)
+    org_text = insert_org_header_args_property(org_text, property_line)
 
     if not keep_source_language:
-        org_text = rewrite_org_block_language(
+        org_text = rewrite_source_block_language(
             org_text,
             source_language=normalized_language,
             target_language=jupyter_block_language,
@@ -305,17 +203,26 @@ def postprocess_org_output(
     output_path.write_text(org_text, encoding="utf-8")
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    """Run the Jupytext to Org conversion command.
+
+    Args:
+        argv: Optional argument list. When omitted, arguments are read from
+            ``sys.argv``.
+
+    Returns:
+        Exit status code ``0`` on success.
+
+    Raises:
+        ConversionError: Input validation fails or an external tool command fails.
+    """
+    args = parse_args(argv)
 
     input_path = args.input_path.expanduser().resolve()
     if not input_path.exists():
         raise ConversionError(f"Input file does not exist: {input_path}")
 
-    try:
-        raise_if_pandoc_is_not_available(min_version="2.7.2")
-    except PandocError as exc:
-        raise ConversionError(str(exc)) from exc
+    ensure_pandoc_available()
 
     output_path = (args.output or infer_output_path(input_path)).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -326,12 +233,12 @@ def main() -> int:
             keep_html_anchors=args.keep_html_anchors,
         )
     else:
-        with tempfile.TemporaryDirectory(prefix="jpy-org-") as temp_dir:
-            temp_md = Path(temp_dir) / f"{input_path.stem}.md"
+        with temporary_directory(prefix="jpy-org-") as temp_dir:
+            temp_md = temp_dir / f"{input_path.stem}{infer_output_suffix('md:pandoc')}"
             markdown_text = convert_with_jupytext_to_markdown(input_path, temp_md)
-            metadata = extract_notebook_metadata_from_markdown(markdown_text)
+            metadata = extract_kernel_metadata_from_markdown(markdown_text)
             if not args.keep_html_anchors:
-                markdown_text = strip_leading_html_anchors(markdown_text)
+                markdown_text = strip_html_anchor_lines(markdown_text)
 
     kernel_name = args.kernel_name or metadata.kernel_name
     kernel_display_name = args.kernel_display_name or metadata.kernel_display_name

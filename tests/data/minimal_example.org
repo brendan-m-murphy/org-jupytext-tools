@@ -1,0 +1,12 @@
+#+TITLE: Minimal Example
+#+JUPYTER_KERNEL_NAME: python3
+#+JUPYTER_KERNEL_DISPLAY_NAME: Python 3
+
+<<example-target>>
+* Demo
+
+Some prose before code.
+
+#+begin_src python
+print("hello")
+#+end_src
