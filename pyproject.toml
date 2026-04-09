@@ -1,0 +1,20 @@
+[project]
+name = "org-jupytext-tools"
+version = "0.1.0"
+description = "Convert between Org and Jupytext notebook formats."
+readme = "README.md"
+authors = [
+    { name = "Brendan Murphy", email = "brendan.murphy@bristol.ac.uk" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "jupytext>=1.19.1",
+]
+
+[project.scripts]
+org2jpy = "org_jupytext_tools.org2jpy:main"
+jpy2org = "org_jupytext_tools.jpy2org:main"
+
+[build-system]
+requires = ["uv_build>=0.11.1,<0.12.0"]
+build-backend = "uv_build"
